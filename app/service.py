@@ -181,6 +181,36 @@ def compute_schedule(
 
 
 # --------------------------------------------------------------------------- #
+# 按目标裁剪执行图（诱导子图）
+# --------------------------------------------------------------------------- #
+def prune_to_targets(
+    edges: list[tuple[str, str]], targets: list[str]
+) -> tuple[set[str], list[tuple[str, str]]]:
+    """保留每个目标及其全部传递前置依赖，返回 (保留节点集合, 保留边列表)。
+
+    多个目标共享的前置只保留一次；与任何目标均无“可达目标”关系的分支被排除。
+    边 (frm, to) 表示 to 依赖 frm，因此沿 to -> frm 反向收集前置即可得到闭包；
+    诱导子图只保留两端均在闭包内的边。调用前已校验完整图合法（无环、无悬空边）
+    且每个目标均存在。
+    """
+    prereqs: dict[str, set[str]] = defaultdict(set)
+    for frm, to in dict.fromkeys(edges):
+        prereqs[to].add(frm)
+
+    kept: set[str] = set()
+    stack = list(targets)
+    while stack:
+        cur = stack.pop()
+        if cur in kept:
+            continue
+        kept.add(cur)
+        stack.extend(prereqs[cur] - kept)
+
+    kept_edges = [(frm, to) for frm, to in dict.fromkeys(edges) if frm in kept and to in kept]
+    return kept, kept_edges
+
+
+# --------------------------------------------------------------------------- #
 # 发布批次
 # --------------------------------------------------------------------------- #
 def create_release(payload: CreateReleaseRequest) -> dict[str, Any]:
@@ -189,8 +219,48 @@ def create_release(payload: CreateReleaseRequest) -> dict[str, Any]:
         dupes = sorted({n for n in node_names if node_names.count(n) > 1})
         raise APIError(422, "duplicate_node", f"节点名重复: {', '.join(dupes)}", {"nodes": dupes})
 
+    # targets 形态校验：非空、不重复（空白元素由请求模型拦截）
+    targets = payload.targets
+    if targets is not None:
+        if len(targets) == 0:
+            raise APIError(422, "empty_targets", "targets 必须为非空数组；不传该字段表示全量发布")
+        if len(set(targets)) != len(targets):
+            dupes = sorted({t for t in targets if targets.count(t) > 1})
+            raise APIError(
+                422, "duplicate_target", f"targets 中存在重复目标: {', '.join(dupes)}",
+                {"targets": dupes},
+            )
+
     edges = [(e.from_node, e.to_node) for e in payload.dependencies]
-    levels = compute_levels(node_names, edges)
+    # 先沿用现有规则校验完整节点与依赖图（重复边在此去重，环 / 悬空边在此拒绝）
+    full_levels = compute_levels(node_names, edges)
+    dedup_edges = list(dict.fromkeys(edges))
+
+    target_set: set[str] = set(targets or ())
+    if targets is not None:
+        # 目标不存在：422 unknown_target，且在任何写入之前抛出（整批零写入）
+        unknown = sorted(target_set - set(node_names))
+        if unknown:
+            raise APIError(
+                422, "unknown_target", f"目标节点不存在: {', '.join(unknown)}",
+                {"targets": unknown},
+            )
+        kept, kept_edges = prune_to_targets(dedup_edges, targets)
+        excluded_count = len(node_names) - len(kept)
+        # levels / 执行 / 回滚 / CPM 全部基于裁剪后的诱导子图重新分层
+        kept_names = [n for n in node_names if n in kept]
+        levels = compute_levels(kept_names, kept_edges)
+        persist_nodes = [n for n in payload.nodes if n.name in kept]
+        persist_edges = kept_edges
+        targets_json: str | None = json.dumps(list(targets))
+    else:
+        # 未传 targets：保持全量发布（levels 即完整图的分层结果）
+        kept = set(node_names)
+        excluded_count = 0
+        levels = full_levels
+        persist_nodes = list(payload.nodes)
+        persist_edges = dedup_edges
+        targets_json = None
 
     release_id = _new_id()
     now = _now()
@@ -198,17 +268,20 @@ def create_release(payload: CreateReleaseRequest) -> dict[str, Any]:
 
     with transaction() as conn:
         conn.execute(
-            """INSERT INTO releases (id, version, status, levels_json, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (release_id, payload.version, R_PENDING, json.dumps(levels), now, now),
+            """INSERT INTO releases
+               (id, version, status, levels_json, targets_json, excluded_node_count,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (release_id, payload.version, R_PENDING, json.dumps(levels),
+             targets_json, excluded_count, now, now),
         )
-        for node in payload.nodes:
+        for node in persist_nodes:
             conn.execute(
                 """INSERT INTO nodes
                    (release_id, name, node_type, estimated_seconds,
-                    max_attempts, retry_delay_seconds, level,
+                    max_attempts, retry_delay_seconds, level, is_target,
                     metadata_json, status, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     release_id,
                     node.name,
@@ -217,12 +290,13 @@ def create_release(payload: CreateReleaseRequest) -> dict[str, Any]:
                     node.max_attempts,
                     node.retry_delay_seconds,
                     level_of[node.name],
+                    1 if node.name in target_set else 0,
                     json.dumps(node.metadata, ensure_ascii=False),
                     PENDING,
                     now,
                 ),
             )
-        for frm, to in dict.fromkeys(edges):  # 去重，保持插入顺序
+        for frm, to in persist_edges:  # 已去重，全部为诱导子图内部边
             conn.execute(
                 "INSERT INTO edges (release_id, from_node, to_node) VALUES (?, ?, ?)",
                 (release_id, frm, to),
@@ -253,6 +327,8 @@ def _release_summary(r: dict[str, Any]) -> dict[str, Any]:
         "version": r["version"],
         "status": r["status"],
         "levels": json.loads(r["levels_json"]),
+        "targets": json.loads(r["targets_json"]) if r.get("targets_json") else None,
+        "excluded_node_count": int(r.get("excluded_node_count") or 0),
         "failed_node": r["failed_node"],
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
@@ -283,6 +359,8 @@ def get_release_plan(
         "release_id": r["id"],
         "version": r["version"],
         "status": r["status"],
+        "targets": json.loads(r["targets_json"]) if r.get("targets_json") else None,
+        "excluded_node_count": int(r.get("excluded_node_count") or 0),
         "total_levels": len(levels),
         "plan": [
             {"level": idx, "parallel_nodes": layer}
@@ -290,6 +368,7 @@ def get_release_plan(
         ],
         "nodes": [
             {"name": n["name"], "node_type": n["node_type"], "level": n["level"],
+             "is_target": bool(n["is_target"]),
              "metadata": json.loads(n["metadata_json"]),
              **node_schedule[n["name"]]}
             for n in nodes
@@ -324,6 +403,7 @@ def _build_view(conn, r) -> dict[str, Any]:
             "node_type": n["node_type"],
             "estimated_seconds": int(n["estimated_seconds"] or 0),
             "level": n["level"],
+            "is_target": bool(n["is_target"]),
             "status": n["status"],
             "reported_version": n["reported_version"],
             "error_code": n["error_code"],
@@ -363,6 +443,8 @@ def _build_view(conn, r) -> dict[str, Any]:
         "version": r["version"],
         "status": r["status"],
         "levels": json.loads(r["levels_json"]),
+        "targets": json.loads(r["targets_json"]) if r.get("targets_json") else None,
+        "excluded_node_count": int(r.get("excluded_node_count") or 0),
         "failed_node": r["failed_node"],
         "error_code": r["error_code"],
         "error_message": r["error_message"],

@@ -292,9 +292,200 @@ with TestClient(app) as client:
     assert sorted(rt["reset_nodes"]) == ["a", "c"]
     print("[OK] 部分回滚 -> 仅回滚 [a]；重试断点 next=[a,b]，重置=[a,c]")
 
+    # --- 12b. targets 裁剪：单目标 + 全部传递前置，无关分支排除，共享前置去重 ---
+    # 图：a,b -> c -> d；e（独立）；f 是 d 的额外前置。targets=["c"] -> 仅 {a,b,c}
+    r = client.post("/api/releases", json={
+        "version": "v-tgt",
+        "nodes": [{"name": "a"}, {"name": "b"}, {"name": "c"},
+                  {"name": "d"}, {"name": "e"}, {"name": "f"}],
+        "dependencies": [
+            {"from_node": "a", "to_node": "c"},
+            {"from_node": "b", "to_node": "c"},
+            {"from_node": "c", "to_node": "d"},
+            {"from_node": "f", "to_node": "d"},
+        ],
+        "targets": ["c"],
+    })
+    assert r.status_code == 201, r.text
+    tb = r.json()
+    ridt = tb["id"]
+    assert tb["targets"] == ["c"] and tb["excluded_node_count"] == 3  # d/e/f 被排除
+    assert tb["levels"] == [["a", "b"], ["c"]], tb["levels"]
+    assert tb["next_nodes"] == ["a", "b"]
+    tnames = {n["name"]: n for n in tb["nodes"]}
+    assert set(tnames) == {"a", "b", "c"}
+    assert tnames["c"]["is_target"] is True
+    assert tnames["a"]["is_target"] is False and tnames["b"]["is_target"] is False
+    assert {(e["from"], e["to"]) for e in tb["dependencies"]} == {("a", "c"), ("b", "c")}
+    # 进度 total 也只统计保留节点
+    assert tb["progress"] == {"succeeded": 0, "total": 3, "completed": False}
+    print("[OK] targets 裁剪 -> 仅保留目标 c 及传递前置 a/b，excluded_node_count=3")
+
+    # plan / CPM 统一基于诱导子图：不出现 d/e/f
+    tp = client.get(f"/api/releases/{ridt}/plan").json()
+    assert tp["targets"] == ["c"] and tp["excluded_node_count"] == 3
+    assert tp["total_levels"] == 2
+    assert {n["name"] for n in tp["nodes"]} == {"a", "b", "c"}
+    assert {n["name"] for n in tp["nodes"] if n["is_target"]} == {"c"}
+    assert {(e["from"], e["to"]) for e in tp["dependencies"]} == {("a", "c"), ("b", "c")}
+    assert "d" not in tp["schedule"]["critical_nodes"]
+    assert tp["schedule"]["critical_path"][-1] == "c"
+    print("[OK] 裁剪批次 plan/CPM 仅含诱导子图节点，is_target 同步标出")
+
+    # 多目标：共享前置只保留一次；目标自身也可在同一 level
+    r = client.post("/api/releases", json={
+        "version": "v-tgt2",
+        "nodes": [{"name": "a"}, {"name": "b"}, {"name": "c"}, {"name": "x"}],
+        "dependencies": [
+            {"from_node": "a", "to_node": "b"},
+            {"from_node": "a", "to_node": "c"},
+            {"from_node": "x", "to_node": "c"},
+        ],
+        "targets": ["b", "c"],
+    })
+    assert r.status_code == 201, r.text
+    tb2 = r.json()
+    ridt2 = tb2["id"]
+    assert tb2["excluded_node_count"] == 0  # a/b/c/x 全部是目标或目标的前置
+    assert {n["name"] for n in tb2["nodes"]} == {"a", "b", "c", "x"}
+    assert {n["name"] for n in tb2["nodes"] if n["is_target"]} == {"b", "c"}
+    assert tb2["levels"] == [["a", "x"], ["b", "c"]], tb2["levels"]
+    # 依赖边全保留（诱导子图内部边）
+    assert len(tb2["dependencies"]) == 3
+    print("[OK] 多目标共享前置 a 只保留一次，x 作为 c 的前置保留，levels 连续重编号")
+
+    # --- 12c. 裁剪批次可正常执行：回报、next_nodes、回滚、重试均不出现排除节点 ---
+    # ridt: level0=[a,b], level1=[c]
+    r = client.post(f"/api/releases/{ridt}/report",
+                    json={"node": "a", "status": "success", "version": "v-tgt"})
+    assert r.status_code == 200 and r.json()["release"]["next_nodes"] == ["b"]
+    # 排除节点无法回报（节点行不存在 -> node_not_found，且不会误放行）
+    r = client.post(f"/api/releases/{ridt}/report",
+                    json={"node": "d", "status": "success", "version": "v-tgt"})
+    assert r.status_code == 404 and r.json()["error"]["code"] == "node_not_found"
+    # c 前置不齐仍拒绝乱序
+    r = client.post(f"/api/releases/{ridt}/report",
+                    json={"node": "c", "status": "success", "version": "v-tgt"})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "out_of_order"
+    r = client.post(f"/api/releases/{ridt}/report",
+                    json={"node": "b", "status": "success", "version": "v-tgt"})
+    assert r.status_code == 200 and r.json()["release"]["next_nodes"] == ["c"]
+    # 目标 c 失败：仅逆序回滚子图内已成功的 b、a；checkpoint 也只有子图节点
+    r = client.post(f"/api/releases/{ridt}/report",
+                    json={"node": "c", "status": "failed", "version": "v-tgt"})
+    assert r.status_code == 200, r.text
+    fb = r.json()
+    assert [x["node"] for x in fb["rolled_back_nodes"]] == ["b", "a"]
+    assert fb["checkpoint"]["restart_nodes"] == ["a", "b"]
+    assert fb["checkpoint"]["restart_level"] == 0
+    assert all(n["name"] in {"a", "b", "c"} for n in fb["release"]["nodes"])
+    assert fb["release"]["excluded_node_count"] == 3
+    # 重试后续发，走完全程 -> succeeded（total=3）
+    assert client.post(f"/api/releases/{ridt}/retry").status_code == 200
+    for node in ("a", "b", "c"):
+        r = client.post(f"/api/releases/{ridt}/report",
+                        json={"node": node, "status": "success", "version": "v-tgt"})
+    assert r.json()["release"]["status"] == "succeeded"
+    assert r.json()["release"]["progress"] == {"succeeded": 3, "total": 3, "completed": True}
+    print("[OK] 裁剪批次执行/乱序拒绝/排除节点 404/回滚/重试全程仅含子图节点")
+
+    # --- 12d. 裁剪改变关键路径：排除的无关长分支不影响 CPM ---
+    # a(10)->b(1)；x(1)->y(100)。全量时最长工期 101；targets=["b"] 后仅剩 a->b，工期 11
+    r = client.post("/api/releases", json={
+        "version": "v-tgt-cpm",
+        "nodes": [
+            {"name": "a", "estimated_seconds": 10},
+            {"name": "b", "estimated_seconds": 1},
+            {"name": "x", "estimated_seconds": 1},
+            {"name": "y", "estimated_seconds": 100},
+        ],
+        "dependencies": [
+            {"from_node": "a", "to_node": "b"},
+            {"from_node": "x", "to_node": "y"},
+        ],
+        "targets": ["b"],
+    })
+    ridt3 = r.json()["id"]
+    sch = client.get(f"/api/releases/{ridt3}/plan").json()["schedule"]
+    assert sch["shortest_duration_seconds"] == 11, sch
+    assert sch["critical_nodes"] == ["a", "b"] and sch["critical_path"] == ["a", "b"]
+    print("[OK] CPM 基于裁剪子图：排除百秒无关分支后最短工期 11、关键路径 a->b")
+
+    # --- 12e. targets 校验：空 / 重复 / 空白 / 不存在（零写入）/ 整图先校验 ---
+    assert client.post("/api/releases", json={
+        "version": "bad-empty", "nodes": [{"name": "a"}], "targets": []
+    }).json()["error"]["code"] == "empty_targets"
+    r = client.post("/api/releases", json={
+        "version": "bad-dup", "nodes": [{"name": "a"}, {"name": "b"}], "targets": ["a", "a"]
+    })
+    assert r.status_code == 422 and r.json()["error"]["code"] == "duplicate_target"
+    assert r.json()["error"]["targets"] == ["a"]
+    # 空白目标名 -> 422（请求模型校验）
+    assert client.post("/api/releases", json={
+        "version": "bad-blank", "nodes": [{"name": "a"}], "targets": ["  "]
+    }).status_code == 422
+    # 非字符串 / 空字符串元素 -> 422（请求模型校验）
+    assert client.post("/api/releases", json={
+        "version": "bad-type", "nodes": [{"name": "a"}], "targets": [123]
+    }).status_code == 422
+    assert client.post("/api/releases", json={
+        "version": "bad-type", "nodes": [{"name": "a"}], "targets": [""]
+    }).status_code == 422
+    # 目标不存在 -> 422 unknown_target，且整批零写入
+    before = client.get("/api/releases?limit=200").json()["items"]
+    r = client.post("/api/releases", json={
+        "version": "bad-ghost",
+        "nodes": [{"name": "a"}, {"name": "b"}],
+        "dependencies": [{"from_node": "a", "to_node": "b"}],
+        "targets": ["b", "ghost"],
+    })
+    assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_target"
+    assert r.json()["error"]["targets"] == ["ghost"]
+    after = client.get("/api/releases?limit=200").json()["items"]
+    assert len(after) == len(before), "unknown_target 必须整批零写入"
+    assert all(i["version"] != "bad-ghost" for i in after)
+    print("[OK] empty/duplicate/blank targets 与 unknown_target(422, 零写入) 校验")
+
+    # 即使环在与目标无关的分支上，也先按整图规则拒绝（先校验完整图再裁剪）
+    r = client.post("/api/releases", json={
+        "version": "bad-tgt-cycle",
+        "nodes": [{"name": "a"}, {"name": "x"}, {"name": "y"}],
+        "dependencies": [
+            {"from_node": "x", "to_node": "y"},
+            {"from_node": "y", "to_node": "x"},
+        ],
+        "targets": ["a"],
+    })
+    assert r.status_code == 422 and r.json()["error"]["code"] == "cycle_detected"
+    # 悬空边同样先于裁剪被拒绝
+    r = client.post("/api/releases", json={
+        "version": "bad-tgt-edge",
+        "nodes": [{"name": "a"}, {"name": "b"}],
+        "dependencies": [{"from_node": "a", "to_node": "zzz"}],
+        "targets": ["a"],
+    })
+    assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_node"
+    print("[OK] targets 裁剪前先校验完整图：无关分支环 / 悬空边均 422")
+
+    # --- 12f. 显式传 null 与不传等价：全量发布 ---
+    r = client.post("/api/releases", json={
+        "version": "v-tgt-null",
+        "nodes": [{"name": "a"}, {"name": "b"}],
+        "dependencies": [{"from_node": "a", "to_node": "b"}],
+        "targets": None,
+    })
+    assert r.status_code == 201, r.text
+    tb4 = r.json()
+    ridt4 = tb4["id"]
+    assert tb4["targets"] is None and tb4["excluded_node_count"] == 0
+    assert {n["name"] for n in tb4["nodes"]} == {"a", "b"}
+    assert all(n["is_target"] is False for n in tb4["nodes"])
+    print("[OK] targets=null 与不传一致：全量发布、targets=null、is_target 全 false")
+
     # --- 13. 列表 & 404 ---
     items = client.get("/api/releases").json()["items"]
-    assert {i["id"] for i in items} == {rid, rid2, rid3, cid, tid, rid_dur}
+    assert {i["id"] for i in items} == {rid, rid2, rid3, cid, tid, rid_dur,
+                                        ridt, ridt2, ridt3, ridt4}
     assert client.get("/api/releases/nope").status_code == 404
     assert client.post("/api/releases/nope/report",
                        json={"node": "a", "status": "success", "version": "v"}).status_code == 404
@@ -306,11 +497,11 @@ from app import database  # noqa: E402
 database.init_db(os.environ["DB_PATH"])
 conn = database.get_conn()
 count = conn.execute("SELECT COUNT(*) AS c FROM releases").fetchone()["c"]
-assert count == 6, count
+assert count == 10, count
 with database.lock():
     v1 = conn.execute("SELECT status, version FROM releases WHERE version='v1'").fetchone()
 assert dict(v1) == {"status": "succeeded", "version": "v1"}
-print("[OK] SQLite 重新初始化幂等，历史数据保留（6 个批次）")
+print("[OK] SQLite 重新初始化幂等，历史数据保留（10 个批次）")
 
 # --- 15. 旧版 DB 文件（nodes 无 estimated_seconds 列）启动自动迁移，旧工期按 0 ---
 import sqlite3  # noqa: E402
@@ -343,8 +534,17 @@ config.DB_PATH = old_db
 database.init_db(old_db)
 cols = {row["name"] for row in database.get_conn().execute("PRAGMA table_info(nodes)")}
 assert "estimated_seconds" in cols, cols
+assert "is_target" in cols, cols  # 旧库幂等补列
+rel_cols = {row["name"] for row in database.get_conn().execute("PRAGMA table_info(releases)")}
+assert {"targets_json", "excluded_node_count"} <= rel_cols, rel_cols
 with TestClient(app) as legacy_client:
+    lg0 = legacy_client.get("/api/releases/leg1").json()
+    # 旧批次：无 targets 概念，按全量发布兼容
+    assert lg0["targets"] is None and lg0["excluded_node_count"] == 0
+    assert all(n["is_target"] is False for n in lg0["nodes"])
     lp = legacy_client.get("/api/releases/leg1/plan").json()
+    assert lp["targets"] is None and lp["excluded_node_count"] == 0
+    assert all(n["is_target"] is False for n in lp["nodes"])
     assert lp["schedule"]["shortest_duration_seconds"] == 0
     assert lp["schedule"]["critical_nodes"] == ["x", "y"]
     assert lp["schedule"]["critical_path"] == ["x", "y"]
@@ -353,7 +553,7 @@ with TestClient(app) as legacy_client:
         "/api/releases/leg1/plan?deadline_seconds=0"
     ).json()["schedule"]
     assert zero_deadline["feasible"] is True and zero_deadline["gap_seconds"] == 0
-print("[OK] 旧库自动迁移 estimated_seconds 列，旧批次工期按 0，CPM 分析完整")
+print("[OK] 旧库自动迁移 estimated_seconds/is_target/targets 列，旧批次按全量发布兼容且 CPM 完整")
 
 # --- 16. 有限自动重试：max_attempts / retry_delay_seconds 校验与持久化 ---
 # 第 15 步把全局连接切到了 legacy.db，先切回主测试库

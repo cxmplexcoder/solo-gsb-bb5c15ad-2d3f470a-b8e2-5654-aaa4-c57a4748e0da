@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS releases (
     id              TEXT PRIMARY KEY,
     version         TEXT NOT NULL,
     status          TEXT NOT NULL,              -- running | succeeded | failed | partially_rolled_back
-    levels_json     TEXT NOT NULL DEFAULT '[]', -- 拓扑层级: [["a"],["b","c"],["d"]]
+    levels_json     TEXT NOT NULL DEFAULT '[]', -- 拓扑层级（按 targets 裁剪后的诱导子图）: [["a"],["b","c"],["d"]]
+    targets_json    TEXT,                       -- 显式目标节点名（JSON 数组）；NULL=未按目标裁剪的全量批次
+    excluded_node_count INTEGER NOT NULL DEFAULT 0, -- 因 targets 裁剪而排除的节点数；全量批次为 0
     error_code      TEXT,
     error_message   TEXT,
     failed_node     TEXT,
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     attempt_count INTEGER NOT NULL DEFAULT 0,     -- 已失败回报次数（原子递增）
     retry_scheduled INTEGER NOT NULL DEFAULT 0,   -- 1=已安排自动重试，等待 next_retry_at 到期
     next_retry_at TEXT,                           -- 重试到期时间（ISO8601），到期前不进入 next_nodes
+    is_target    INTEGER NOT NULL DEFAULT 0,      -- 1=创建批次时显式指定的目标节点，旧批次兼容为 0
     level        INTEGER NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     status       TEXT NOT NULL DEFAULT 'pending', -- pending | success | failed | rolled_back
@@ -106,6 +109,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     if "next_retry_at" not in cols:
         conn.execute("ALTER TABLE nodes ADD COLUMN next_retry_at TEXT")
+    if "is_target" not in cols:
+        # 旧批次均为创建时全量发布：没有显式目标概念，统一按 0 兼容
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN is_target INTEGER NOT NULL DEFAULT 0"
+        )
+
+    release_cols = {row["name"] for row in conn.execute("PRAGMA table_info(releases)")}
+    if "targets_json" not in release_cols:
+        # NULL 表示全量批次：与旧批次“整图发布”的行为完全一致
+        conn.execute("ALTER TABLE releases ADD COLUMN targets_json TEXT")
+    if "excluded_node_count" not in release_cols:
+        conn.execute(
+            "ALTER TABLE releases ADD COLUMN excluded_node_count INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def init_db(db_path: str | None = None) -> None:

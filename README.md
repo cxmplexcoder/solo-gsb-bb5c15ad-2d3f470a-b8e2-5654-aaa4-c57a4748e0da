@@ -1,7 +1,7 @@
 # 依赖图发布回滚 API（FastAPI + SQLite）
 
 本地可运行的服务节点依赖图发布系统：客户端提交服务节点及依赖关系（节点可带正整数预估工期 `estimated_seconds`），
-创建带版本号的发布批次；
+创建带版本号的发布批次（可选传 `targets` **按目标节点裁剪执行图**：只发布每个目标及其全部传递前置依赖）；
 系统按**拓扑层级**生成执行计划，并对依赖 DAG 做**关键路径（CPM）动态规划**给出最短工期、各节点最早/最晚开始时间与零余量关键节点；
 接收每个节点的成功/失败回报；节点失败时若**自动重试额度未用尽**则原子递增尝试次数、将节点恢复为 `pending`
 并按可配置延迟安排重试（到期前节点不会出现在 `next_nodes`，提前回报返回 `409 retry_not_due`）；
@@ -49,6 +49,24 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ## 核心语义
+
+**按目标裁剪执行图（可选 `targets`）**
+
+创建批次时可选传 `targets`：非空、元素非空字符串且**不重复**的节点名数组；**不传时保持全量发布**。
+
+- 传入后**先沿用现有规则校验完整节点和依赖图**（重复节点、悬空依赖边、循环依赖等针对整图校验，
+  即使问题出在与目标无关的分支也会被拒绝），校验通过后再裁剪；
+- 裁剪结果 = 每个目标 + 其**全部传递前置依赖**构成的**诱导子图**：多个目标共享的前置只保留一次，
+  无关分支（既非目标、也不是任何目标的前置）不进入批次；
+- 仅裁剪后的节点与边会被**持久化并执行**；`levels`、`plan`、`next_nodes`、失败回滚、断点重试与
+  **关键路径（CPM）分析统一基于裁剪后的诱导子图**，任何响应中都不会出现已排除节点（排除节点重新分层后
+  level 从 0 连续编号）；
+- 创建响应中每个保留节点带 `is_target`（是否为显式目标，传递前置为 `false`），批次级返回
+  `targets`（显式目标名，全量批次为 `null`）与 `excluded_node_count`（被排除节点数，全量批次为 `0`）；
+- `targets: []` 返回 `422 empty_targets`、目标重复返回 `422 duplicate_target`、目标节点不存在返回
+  **`422 unknown_target` 且整批零写入**（不创建批次、不写节点 / 边）；
+- 旧数据库与旧批次通过启动时幂等迁移兼容（`releases.targets_json` 为 `NULL`、
+  `excluded_node_count` 为 `0`、`nodes.is_target` 为 `0`），行为与裁剪前完全一致。
 
 **执行计划（拓扑分层 + 工期分析）**
 
@@ -126,7 +144,7 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖；节点可填正整数 `estimated_seconds`、`max_attempts`(1~10)、`retry_delay_seconds`(0~3600)，自动拓扑分层，拒绝环） |
+| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖；可选非空不重复 `targets` 按目标裁剪为诱导子图；节点可填正整数 `estimated_seconds`、`max_attempts`(1~10)、`retry_delay_seconds`(0~3600)，自动拓扑分层，拒绝环） |
 | `GET` | `/api/releases?limit=50` | 发布批次列表 |
 | `GET` | `/api/releases/{id}` | 查询发布状态（节点状态含 `attempt_count` / `max_attempts` / `next_retry_at`、进度、next_nodes，未到期重试节点不出现） |
 | `GET` | `/api/releases/{id}/plan?deadline_seconds=` | 拓扑分层 + CPM 工期分析（最短工期、最早/最晚开始、total_slack、零余量关键节点、字典序最小关键路径；可选截止工期可行性，只读） |
@@ -189,6 +207,36 @@ curl -s 'http://localhost:8000/api/releases/<ID>/plan?deadline_seconds=8'
 #   "critical_path": ["svc-b", "svc-c", "svc-d"]
 # }
 # 每个节点附带：estimated_seconds / earliest_start / latest_start / total_slack / is_critical
+
+# 2c) 按目标裁剪：同一批节点只发布 svc-d（带上其传递前置 a/b/c），svc-e 无关分支不入库
+curl -s -X POST http://localhost:8000/api/releases \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "2026.09.21-004",
+    "nodes": [
+      {"name": "svc-a"}, {"name": "svc-b"}, {"name": "svc-c"},
+      {"name": "svc-d"}, {"name": "svc-e"}
+    ],
+    "dependencies": [
+      {"from_node": "svc-a", "to_node": "svc-c"},
+      {"from_node": "svc-b", "to_node": "svc-c"},
+      {"from_node": "svc-c", "to_node": "svc-d"},
+      {"from_node": "svc-e", "to_node": "svc-d"}
+    ],
+    "targets": ["svc-d"]
+  }'
+# -> targets=["svc-d"], excluded_node_count=0（e 是 d 的前置，同样保留）
+#    levels=[[svc-a,svc-b,svc-e],[svc-c],[svc-d]]
+#    仅 svc-d 的 is_target=true；next_nodes=[svc-a,svc-b,svc-e]
+#
+# 多目标共享前置只保留一次；无关分支被排除：
+#   节点 a,b,c,d,e；边 a->c, b->c, c->d, e（独立）；targets=["c"]
+#   -> 保留 {a,b,c}，excluded_node_count=2（d、e 排除），levels=[[a,b],[c]]
+#
+# 目标不存在 -> 422 且整批零写入：
+#   {"error":{"code":"unknown_target","targets":["ghost"], ...}}
+# targets=[] -> 422 empty_targets；targets=["c","c"] -> 422 duplicate_target
+# 不传 targets 或传 null -> 与旧版本一致的全量发布（targets=null, excluded_node_count=0）
 
 # 3) 回报 level0 成功（同层可并行/乱序回报）
 curl -s -X POST http://localhost:8000/api/releases/<ID>/report \
@@ -284,4 +332,8 @@ CPM 前向/后向分析与零余量关键节点、并列最长路径字典序最
 查询不改变批次状态、estimated_seconds 正整数校验、旧版 SQLite 文件自动迁移且旧工期按 0、
 max_attempts / retry_delay_seconds 取值校验与持久化、失败未达上限原子递增并调度重试（不回滚）、
 等待期排除 next_nodes 且提前回报 409 retry_not_due 状态不变、到期后重新出现、达到上限走终态回滚、
-retry_delay_seconds=0 立即重试、手动 /retry 清零计数刷新额度、旧批次 max_attempts 默认 1 兼容。
+retry_delay_seconds=0 立即重试、手动 /retry 清零计数刷新额度、旧批次 max_attempts 默认 1 兼容、
+targets 按目标裁剪诱导子图（传递前置闭包、共享前置去重、无关分支排除、levels 连续重编号）、
+裁剪批次的 plan/CPM/next_nodes/回报/回滚/重试不含已排除节点、裁剪改变关键路径分析、
+targets 空/重复/空白/类型校验、unknown_target 422 且整批零写入、裁剪前先校验整图（环/悬空边）、
+targets=null 全量发布、旧库补列（targets_json/excluded_node_count/is_target）且旧批次按全量兼容。
