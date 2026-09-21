@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS releases (
     version         TEXT NOT NULL,
     status          TEXT NOT NULL,              -- running | succeeded | failed | partially_rolled_back
     levels_json     TEXT NOT NULL DEFAULT '[]', -- 拓扑层级: [["a"],["b","c"],["d"]]
+    targets_json    TEXT,                       -- 显式目标列表 JSON；NULL = 全量发布（旧批次兼容）
+    excluded_node_count INTEGER NOT NULL DEFAULT 0, -- 按 targets 裁剪时被排除的节点数
     error_code      TEXT,
     error_message   TEXT,
     failed_node     TEXT,
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     attempt_count INTEGER NOT NULL DEFAULT 0,     -- 已失败回报次数（原子递增）
     retry_scheduled INTEGER NOT NULL DEFAULT 0,   -- 1=已安排自动重试，等待 next_retry_at 到期
     next_retry_at TEXT,                           -- 重试到期时间（ISO8601），到期前不进入 next_nodes
+    is_target    INTEGER NOT NULL DEFAULT 1,      -- 1=发布目标（显式或全量）；0=仅作为传递前置保留
     level        INTEGER NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     status       TEXT NOT NULL DEFAULT 'pending', -- pending | success | failed | rolled_back
@@ -106,6 +109,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     if "next_retry_at" not in cols:
         conn.execute("ALTER TABLE nodes ADD COLUMN next_retry_at TEXT")
+    if "is_target" not in cols:
+        # 旧批次视为全量发布：所有节点都是发布目标
+        conn.execute("ALTER TABLE nodes ADD COLUMN is_target INTEGER NOT NULL DEFAULT 1")
+
+    rcols = {row["name"] for row in conn.execute("PRAGMA table_info(releases)")}
+    if "targets_json" not in rcols:
+        # 旧批次无显式目标：NULL 表示全量发布
+        conn.execute("ALTER TABLE releases ADD COLUMN targets_json TEXT")
+    if "excluded_node_count" not in rcols:
+        conn.execute(
+            "ALTER TABLE releases ADD COLUMN excluded_node_count INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def init_db(db_path: str | None = None) -> None:

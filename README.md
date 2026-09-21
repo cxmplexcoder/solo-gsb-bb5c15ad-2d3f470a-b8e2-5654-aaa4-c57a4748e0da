@@ -1,7 +1,8 @@
 # 依赖图发布回滚 API（FastAPI + SQLite）
 
 本地可运行的服务节点依赖图发布系统：客户端提交服务节点及依赖关系（节点可带正整数预估工期 `estimated_seconds`），
-创建带版本号的发布批次；
+创建带版本号的发布批次；创建时可选传 `targets` **按目标裁剪执行图**——仅持久化并执行各目标及其全部传递前置依赖
+（共享前置只保留一次），无关分支不进入批次，未传时保持全量发布；
 系统按**拓扑层级**生成执行计划，并对依赖 DAG 做**关键路径（CPM）动态规划**给出最短工期、各节点最早/最晚开始时间与零余量关键节点；
 接收每个节点的成功/失败回报；节点失败时若**自动重试额度未用尽**则原子递增尝试次数、将节点恢复为 `pending`
 并按可配置延迟安排重试（到期前节点不会出现在 `next_nodes`，提前回报返回 `409 retry_not_due`）；
@@ -49,6 +50,21 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ## 核心语义
+
+**按目标裁剪（targets，可选）**
+
+- 创建批次时可传 `targets`（**非空且不重复**的节点名列表）；不传（或传 `null`）保持全量发布，行为与之前完全一致。
+- 传入后先按既有规则校验**完整**节点与依赖图（重复节点、未知节点引用、循环依赖照常 `422`），
+  再仅持久化并执行**每个目标及其全部传递前置依赖**构成的诱导子图：
+  多个目标共享的前置只保留一次，与目标无关的分支不进入批次（数据库中也不存在）。
+- `levels`、`plan`、`next_nodes`、失败回滚与关键路径（CPM）分析全部统一基于裁剪后的诱导子图，
+  被排除的节点不出现在任何视图或分析中（对被排除节点回报返回 `404 node_not_found`）。
+- 创建响应（及状态查询 / 计划接口）中每个保留节点带 `is_target` 标记是否为显式目标，
+  并返回 `excluded_node_count`（被排除节点数）与 `targets`（显式目标列表；全量发布为 `null`）。
+- 目标不存在返回 `422 unknown_target`（携带不存在的目标列表），**整批零写入**；
+  `targets` 为空数组或含重复项同样 `422`（重复项为 `duplicate_target`）。
+- 旧批次自动迁移兼容：`is_target` 缺省 `1`、`targets` 为 `null`、`excluded_node_count` 为 `0`，
+  语义等同全量发布（`ALTER TABLE` 补列，幂等）。
 
 **执行计划（拓扑分层 + 工期分析）**
 
@@ -126,9 +142,9 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖；节点可填正整数 `estimated_seconds`、`max_attempts`(1~10)、`retry_delay_seconds`(0~3600)，自动拓扑分层，拒绝环） |
-| `GET` | `/api/releases?limit=50` | 发布批次列表 |
-| `GET` | `/api/releases/{id}` | 查询发布状态（节点状态含 `attempt_count` / `max_attempts` / `next_retry_at`、进度、next_nodes，未到期重试节点不出现） |
+| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖；可选 `targets` 按目标裁剪执行图，仅保留目标及其传递前置；节点可填正整数 `estimated_seconds`、`max_attempts`(1~10)、`retry_delay_seconds`(0~3600)，自动拓扑分层，拒绝环） |
+| `GET` | `/api/releases?limit=50` | 发布批次列表（含 `targets` / `excluded_node_count`） |
+| `GET` | `/api/releases/{id}` | 查询发布状态（节点状态含 `is_target` / `attempt_count` / `max_attempts` / `next_retry_at`、进度、next_nodes，未到期重试节点不出现） |
 | `GET` | `/api/releases/{id}/plan?deadline_seconds=` | 拓扑分层 + CPM 工期分析（最短工期、最早/最晚开始、total_slack、零余量关键节点、字典序最小关键路径；可选截止工期可行性，只读） |
 | `POST` | `/api/releases/{id}/report` | 节点成功 / 失败回报（跨版本、乱序返回 409；自动重试等待期返回 409 retry_not_due；未达上限返回 retry_scheduled，达上限失败回滚） |
 | `POST` | `/api/releases/{id}/retry` | 从断点续发 |
@@ -189,6 +205,30 @@ curl -s 'http://localhost:8000/api/releases/<ID>/plan?deadline_seconds=8'
 #   "critical_path": ["svc-b", "svc-c", "svc-d"]
 # }
 # 每个节点附带：estimated_seconds / earliest_start / latest_start / total_slack / is_critical
+
+# 2c) 按目标裁剪：只发布 svc-d 及其传递前置，无关分支 svc-x 不进入批次
+curl -s -X POST http://localhost:8000/api/releases \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "2026.09.21-004",
+    "nodes": [
+      {"name": "svc-a"}, {"name": "svc-b"},
+      {"name": "svc-c"}, {"name": "svc-d"},
+      {"name": "svc-x"}
+    ],
+    "dependencies": [
+      {"from_node": "svc-a", "to_node": "svc-c"},
+      {"from_node": "svc-b", "to_node": "svc-c"},
+      {"from_node": "svc-c", "to_node": "svc-d"},
+      {"from_node": "svc-a", "to_node": "svc-x"}
+    ],
+    "targets": ["svc-d"]
+  }'
+# -> 保留 svc-a/svc-b/svc-c/svc-d（svc-d 的全部传递前置），svc-x 被排除：
+#    excluded_node_count=1，targets=["svc-d"]，svc-d 的 is_target=true、其余为 false
+#    levels=[[svc-a,svc-b],[svc-c],[svc-d]]；后续 plan / 回报 / 回滚 / CPM 均只涉及这 4 个节点
+# 多目标示例："targets": ["svc-d", "svc-x"] -> 共享前置 svc-a 只保留一次，excluded_node_count=0
+# 目标不存在 -> 422 {"error":{"code":"unknown_target","targets":["svc-ghost"]}}，整批零写入
 
 # 3) 回报 level0 成功（同层可并行/乱序回报）
 curl -s -X POST http://localhost:8000/api/releases/<ID>/report \
@@ -263,7 +303,7 @@ curl -i -X POST http://localhost:8000/api/releases \
 │   ├── database.py    # SQLite 连接、建表、事务
 │   ├── models.py      # 请求模型
 │   ├── errors.py      # 业务异常
-│   └── service.py     # 拓扑分层 / 批次 / 回报 / 回滚 / 重试
+│   └── service.py     # 拓扑分层 / 目标裁剪 / 批次 / 回报 / 回滚 / 重试
 ├── requirements.txt
 ├── smoke_test.py      # 端到端冒烟测试（pip install httpx 后 python3 smoke_test.py）
 ├── Dockerfile         # 构建期安装依赖
@@ -284,4 +324,8 @@ CPM 前向/后向分析与零余量关键节点、并列最长路径字典序最
 查询不改变批次状态、estimated_seconds 正整数校验、旧版 SQLite 文件自动迁移且旧工期按 0、
 max_attempts / retry_delay_seconds 取值校验与持久化、失败未达上限原子递增并调度重试（不回滚）、
 等待期排除 next_nodes 且提前回报 409 retry_not_due 状态不变、到期后重新出现、达到上限走终态回滚、
-retry_delay_seconds=0 立即重试、手动 /retry 清零计数刷新额度、旧批次 max_attempts 默认 1 兼容。
+retry_delay_seconds=0 立即重试、手动 /retry 清零计数刷新额度、旧批次 max_attempts 默认 1 兼容、
+targets 裁剪（共享前置去重、无关分支不持久化、is_target 标记、excluded_node_count）、
+unknown_target / 重复 / 空 targets 返回 422 且整批零写入、完整图校验优先于裁剪、
+裁剪子图上的 levels / plan / CPM / 回报 / 回滚 / 重试全流程、被排除节点回报 404、
+未传 targets 全量发布兼容、旧库新列（is_target / targets_json / excluded_node_count）幂等迁移。

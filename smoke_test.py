@@ -503,4 +503,199 @@ with TestClient(app) as legacy_client:
     assert r.json()["release"]["status"] == "failed"
 print("[OK] 旧批次 max_attempts 默认 1：首次失败即终态回滚，详情返回全部重试字段")
 
+# --- 22. targets 校验：unknown_target / 重复 / 空 -> 422，且整批零写入 ---
+config.DB_PATH = os.environ["DB_PATH"]
+database.init_db(os.environ["DB_PATH"])
+conn = database.get_conn()
+before = conn.execute("SELECT COUNT(*) AS c FROM releases").fetchone()["c"]
+
+r = client.post("/api/releases", json={
+    "version": "v-tgt-bad", "nodes": [{"name": "a"}], "targets": ["ghost"]})
+assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_target"
+assert r.json()["error"]["targets"] == ["ghost"]
+r = client.post("/api/releases", json={
+    "version": "v-tgt-bad2", "nodes": [{"name": "a"}, {"name": "b"}],
+    "targets": ["a", "ghost1", "ghost2"]})
+assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_target"
+assert r.json()["error"]["targets"] == ["ghost1", "ghost2"]
+r = client.post("/api/releases", json={
+    "version": "v-tgt-bad3", "nodes": [{"name": "a"}], "targets": ["a", "a"]})
+assert r.status_code == 422 and r.json()["error"]["code"] == "duplicate_target"
+r = client.post("/api/releases", json={
+    "version": "v-tgt-bad4", "nodes": [{"name": "a"}], "targets": []})
+assert r.status_code == 422  # 空 targets 由请求模型拒绝
+after = conn.execute("SELECT COUNT(*) AS c FROM releases").fetchone()["c"]
+assert after == before  # 所有失败校验整批零写入
+print("[OK] unknown_target / duplicate_target / 空 targets -> 422，整批零写入")
+
+# --- 23. 完整图校验优先于裁剪：图非法时即使 targets 合法也拒绝 ---
+r = client.post("/api/releases", json={
+    "version": "v-tgt-cycle",
+    "nodes": [{"name": "x"}, {"name": "y"}, {"name": "z"}],
+    "dependencies": [
+        {"from_node": "x", "to_node": "y"},
+        {"from_node": "y", "to_node": "x"},
+    ],
+    "targets": ["z"],  # z 不在环上，但完整图有环仍拒绝
+})
+assert r.status_code == 422 and r.json()["error"]["code"] == "cycle_detected"
+r = client.post("/api/releases", json={
+    "version": "v-tgt-unk",
+    "nodes": [{"name": "x"}],
+    "dependencies": [{"from_node": "x", "to_node": "ghost"}],
+    "targets": ["x"],
+})
+assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_node"
+after = conn.execute("SELECT COUNT(*) AS c FROM releases").fetchone()["c"]
+assert after == before
+print("[OK] 完整图校验（cycle / unknown_node）优先于 targets 裁剪生效")
+
+# --- 24. 按目标裁剪：共享前置只保留一次，无关分支不进入批次 ---
+# 完整图：base-a/base-b 底层；mid-c 依赖两者；mid-d 依赖 base-a；
+# leaf-e 依赖 mid-c；leaf-f 依赖 mid-d；unrelated-g 依赖 base-b（无关分支）；unrelated-h 孤立
+r = client.post("/api/releases", json={
+    "version": "v-tgt",
+    "nodes": [
+        {"name": "base-a", "estimated_seconds": 2},
+        {"name": "base-b", "estimated_seconds": 5},
+        {"name": "mid-c", "estimated_seconds": 3},
+        {"name": "mid-d", "estimated_seconds": 4},
+        {"name": "leaf-e", "estimated_seconds": 1},
+        {"name": "leaf-f", "estimated_seconds": 1},
+        {"name": "unrelated-g", "estimated_seconds": 100},
+        {"name": "unrelated-h"},
+    ],
+    "dependencies": [
+        {"from_node": "base-a", "to_node": "mid-c"},
+        {"from_node": "base-b", "to_node": "mid-c"},
+        {"from_node": "base-a", "to_node": "mid-d"},
+        {"from_node": "mid-c", "to_node": "leaf-e"},
+        {"from_node": "mid-d", "to_node": "leaf-f"},
+        {"from_node": "base-b", "to_node": "unrelated-g"},
+    ],
+    "targets": ["leaf-e", "leaf-f"],
+})
+assert r.status_code == 201, r.text
+body = r.json()
+rtid = body["id"]
+names = {n["name"] for n in body["nodes"]}
+# 两个目标共享的前置 base-a/base-b 只保留一次；无关分支 g/h 不进入批次
+assert names == {"base-a", "base-b", "mid-c", "mid-d", "leaf-e", "leaf-f"}, names
+assert body["targets"] == ["leaf-e", "leaf-f"]
+assert body["excluded_node_count"] == 2
+is_target = {n["name"]: n["is_target"] for n in body["nodes"]}
+assert is_target == {"base-a": False, "base-b": False, "mid-c": False, "mid-d": False,
+                     "leaf-e": True, "leaf-f": True}, is_target
+# levels / next_nodes / 依赖列表均基于裁剪后的诱导子图，无已排除节点
+assert body["levels"] == [["base-a", "base-b"], ["mid-c", "mid-d"], ["leaf-e", "leaf-f"]]
+assert body["next_nodes"] == ["base-a", "base-b"]
+deps = {(d["from"], d["to"]) for d in body["dependencies"]}
+assert deps == {("base-a", "mid-c"), ("base-b", "mid-c"), ("base-a", "mid-d"),
+                ("mid-c", "leaf-e"), ("mid-d", "leaf-f")}, deps
+# 数据库中也不存在被排除的节点 / 边
+db_names = {row["name"] for row in conn.execute(
+    "SELECT name FROM nodes WHERE release_id = ?", (rtid,))}
+assert db_names == names
+db_edges = {(row["from_node"], row["to_node"]) for row in conn.execute(
+    "SELECT from_node, to_node FROM edges WHERE release_id = ?", (rtid,))}
+assert db_edges == deps
+print("[OK] targets 裁剪：共享前置去重、无关分支排除、is_target 标记、excluded_node_count=2")
+
+# --- 25. plan / CPM 统一基于裁剪子图：unrelated-g(100s) 不参与关键路径 ---
+tp = client.get(f"/api/releases/{rtid}/plan").json()
+assert tp["targets"] == ["leaf-e", "leaf-f"] and tp["excluded_node_count"] == 2
+tnames = {n["name"] for n in tp["nodes"]}
+assert "unrelated-g" not in tnames and "unrelated-h" not in tnames
+assert all(d["from"] in tnames and d["to"] in tnames for d in tp["dependencies"])
+tsch = tp["schedule"]
+# b->c->e = 5+3+1 = 9 为最短总工期（若 unrelated-g 未被排除则会是 100）
+assert tsch["shortest_duration_seconds"] == 9, tsch
+assert tsch["critical_nodes"] == ["base-b", "mid-c", "leaf-e"]
+assert tsch["critical_path"] == ["base-b", "mid-c", "leaf-e"]
+tt = {n["name"]: n for n in tp["nodes"]}
+# base-a 有两个后继：LF=min(LS_c=5, LS_d=4)=4 -> slack=2
+assert tt["base-a"]["total_slack"] == 2
+assert tt["mid-d"]["earliest_start"] == 2 and tt["leaf-f"]["earliest_start"] == 6
+assert tt["leaf-f"]["total_slack"] == 2
+assert tt["leaf-e"]["is_critical"] is True and tt["leaf-f"]["is_critical"] is False
+# plan 节点同样带 is_target 标记
+assert {n["name"] for n in tp["nodes"] if n["is_target"]} == {"leaf-e", "leaf-f"}
+print("[OK] plan/CPM 基于裁剪子图：最短工期 9，关键路径", tsch["critical_path"])
+
+# --- 26. 裁剪批次的回报 / 回滚 / 断点重试只涉及保留节点 ---
+r = client.post(f"/api/releases/{rtid}/report",
+                json={"node": "base-a", "status": "success", "version": "v-tgt"})
+assert r.status_code == 200
+# 被排除节点不在批次中：回报返回 404 node_not_found
+r = client.post(f"/api/releases/{rtid}/report",
+                json={"node": "unrelated-g", "status": "success", "version": "v-tgt"})
+assert r.status_code == 404 and r.json()["error"]["code"] == "node_not_found"
+# 乱序校验在裁剪子图上生效（mid-c 还等 base-b）
+r = client.post(f"/api/releases/{rtid}/report",
+                json={"node": "mid-c", "status": "success", "version": "v-tgt"})
+assert r.status_code == 409 and r.json()["error"]["code"] == "out_of_order"
+assert r.json()["error"]["blockers"] == [{"node": "base-b", "status": "pending"}]
+r = client.post(f"/api/releases/{rtid}/report",
+                json={"node": "base-b", "status": "success", "version": "v-tgt"})
+assert r.status_code == 200
+# mid-d 失败 -> 仅回滚本批次（裁剪后）已成功的 base-a/base-b
+r = client.post(f"/api/releases/{rtid}/report",
+                json={"node": "mid-d", "status": "failed", "version": "v-tgt"})
+fb = r.json()
+assert fb["result"] == "failed_and_rolled_back"
+assert sorted(x["node"] for x in fb["rolled_back_nodes"]) == ["base-a", "base-b"]
+rst = fb["release"]
+assert rst["targets"] == ["leaf-e", "leaf-f"] and rst["excluded_node_count"] == 2
+ns = {n["name"]: n["status"] for n in rst["nodes"]}
+assert ns == {"base-a": "rolled_back", "base-b": "rolled_back", "mid-c": "pending",
+              "mid-d": "failed", "leaf-e": "pending", "leaf-f": "pending"}, ns
+# 断点重试后走完全程
+r = client.post(f"/api/releases/{rtid}/retry")
+assert r.status_code == 200
+assert r.json()["checkpoint"]["next_nodes"] == ["base-a", "base-b"]
+for node in ("base-a", "base-b", "mid-c", "mid-d", "leaf-e", "leaf-f"):
+    r = client.post(f"/api/releases/{rtid}/report",
+                    json={"node": node, "status": "success", "version": "v-tgt"})
+    assert r.status_code == 200, r.text
+assert r.json()["release"]["status"] == "succeeded"
+assert r.json()["release"]["progress"] == {"succeeded": 6, "total": 6, "completed": True}
+print("[OK] 裁剪批次回报/回滚/重试全程仅涉及保留节点，被排除节点 404")
+
+# --- 27. 未传 targets：全量发布，响应字段保持兼容语义 ---
+r = client.post("/api/releases", json={
+    "version": "v-full",
+    "nodes": [{"name": "a"}, {"name": "b"}],
+    "dependencies": [{"from_node": "a", "to_node": "b"}],
+})
+assert r.status_code == 201
+body = r.json()
+rid_full = body["id"]
+assert body["targets"] is None and body["excluded_node_count"] == 0
+assert all(n["is_target"] is True for n in body["nodes"])
+assert body["levels"] == [["a"], ["b"]]
+# 列表摘要同样带 targets / excluded_node_count
+items = client.get("/api/releases").json()["items"]
+item = next(i for i in items if i["id"] == rid_full)
+assert item["targets"] is None and item["excluded_node_count"] == 0
+item = next(i for i in items if i["id"] == rtid)
+assert item["targets"] == ["leaf-e", "leaf-f"] and item["excluded_node_count"] == 2
+print("[OK] 未传 targets 全量发布：targets=null、excluded_node_count=0、is_target 全 true")
+
+# --- 28. 旧库迁移：新列幂等补齐，旧批次按全量发布兼容 ---
+config.DB_PATH = old_db
+database.init_db(old_db)
+cols = {row["name"] for row in database.get_conn().execute("PRAGMA table_info(nodes)")}
+assert "is_target" in cols, cols
+rcols = {row["name"] for row in database.get_conn().execute("PRAGMA table_info(releases)")}
+assert "targets_json" in rcols and "excluded_node_count" in rcols, rcols
+with TestClient(app) as legacy_client:
+    lg = legacy_client.get("/api/releases/leg1").json()
+    assert lg["targets"] is None and lg["excluded_node_count"] == 0
+    assert all(n["is_target"] is True for n in lg["nodes"])
+    lp = legacy_client.get("/api/releases/leg1/plan").json()
+    assert lp["targets"] is None and lp["excluded_node_count"] == 0
+    assert all(n["is_target"] is True for n in lp["nodes"])
+database.init_db(old_db)  # 重复迁移幂等
+print("[OK] 旧库幂等迁移 is_target/targets_json/excluded_node_count，旧批次按全量发布兼容")
+
 print("\n全部测试通过 ✔")

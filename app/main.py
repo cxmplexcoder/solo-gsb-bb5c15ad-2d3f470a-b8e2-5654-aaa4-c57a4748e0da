@@ -43,7 +43,12 @@ def health() -> dict:
 
 @app.post("/api/releases", status_code=201, tags=["releases"])
 def create_release(payload: CreateReleaseRequest) -> dict:
-    """创建带版本号的发布批次；循环依赖返回 422 cycle_detected。"""
+    """创建带版本号的发布批次；循环依赖返回 422 cycle_detected。
+
+    可选传 `targets`（非空且不重复）：先按完整图校验，再仅持久化并执行
+    各目标及其全部传递前置依赖构成的诱导子图；目标不存在返回 422 unknown_target，
+    整批零写入。未传 targets 时保持全量发布。
+    """
     return service.create_release(payload)
 
 

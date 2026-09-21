@@ -1,7 +1,7 @@
 """Pydantic 请求模型。"""
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 
@@ -31,6 +31,11 @@ class CreateReleaseRequest(BaseModel):
     version: str = Field(..., min_length=1, description="发布版本号，如 2026.09.20-001")
     nodes: list[NodeInput] = Field(..., min_length=1, description="服务节点列表")
     dependencies: list[EdgeInput] = Field(default_factory=list, description="依赖边 from->to")
+    targets: list[Annotated[str, Field(min_length=1)]] | None = Field(
+        None, min_length=1,
+        description="显式目标节点（非空且不重复）；不传全量发布，"
+                    "传入时仅持久化并执行各目标及其全部传递前置依赖",
+    )
 
 
 class ReportRequest(BaseModel):
